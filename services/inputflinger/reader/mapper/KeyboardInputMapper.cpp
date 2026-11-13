@@ -20,9 +20,15 @@
 
 #include "KeyboardInputMapper.h"
 
+#include <android-base/properties.h>
+#include <android-base/strings.h>
 #include <ftl/enum.h>
 #include <input/KeyboardClassifier.h>
 #include <ui/Rotation.h>
+
+#include <algorithm>
+#include <string>
+#include <vector>
 
 namespace android {
 
@@ -67,6 +73,45 @@ static int32_t rotateKeyCode(int32_t keyCode, ui::Rotation orientation, int rota
         }
     }
     return keyCode;
+}
+
+// Displays (by unique id, e.g. "local:4630947043778501764") that are mounted upside down
+// relative to the volume keys, such as the cover panel of a flip phone: the half carrying the
+// keys is flipped over when the phone folds, so "up" on the keys points down on that panel.
+// Volume up and down are swapped on these displays, on top of any rotation-based swapping.
+static const std::vector<std::string>& getVolumeKeysFlippedDisplays() {
+    static const std::vector<std::string> displays = [] {
+        std::vector<std::string> result;
+        for (const std::string& id : android::base::Split(
+                     android::base::GetProperty("ro.input.volume_keys_flipped_displays", ""),
+                     ",")) {
+            std::string trimmed = android::base::Trim(id);
+            if (!trimmed.empty()) {
+                result.push_back(std::move(trimmed));
+            }
+        }
+        return result;
+    }();
+    return displays;
+}
+
+static bool isVolumeKeysFlippedViewport(const std::optional<DisplayViewport>& viewport) {
+    if (!viewport) {
+        return false;
+    }
+    const std::vector<std::string>& displays = getVolumeKeysFlippedDisplays();
+    return std::find(displays.begin(), displays.end(), viewport->uniqueId) != displays.end();
+}
+
+static int32_t flipVolumeKeyCode(int32_t keyCode) {
+    switch (keyCode) {
+        case AKEYCODE_VOLUME_UP:
+            return AKEYCODE_VOLUME_DOWN;
+        case AKEYCODE_VOLUME_DOWN:
+            return AKEYCODE_VOLUME_UP;
+        default:
+            return keyCode;
+    }
 }
 
 static bool isSupportedScanCode(int32_t scanCode) {
@@ -159,6 +204,7 @@ void KeyboardInputMapper::dump(std::string& dump) {
     dump += INDENT2 "Keyboard Input Mapper:\n";
     dumpParameters(dump);
     dump += StringPrintf(INDENT3 "Orientation: %s\n", ftl::enum_string(getOrientation()).c_str());
+    dump += StringPrintf(INDENT3 "VolumeKeysFlipped: %s\n", toString(mVolumeKeysFlipped));
     dump += StringPrintf(INDENT3 "KeyDowns: %zu keys currently down\n", mKeyDowns.size());
     dump += StringPrintf(INDENT3 "MetaState: 0x%0x\n", mMetaState);
     dump += INDENT3 "KeyboardLayoutInfo: ";
@@ -195,6 +241,7 @@ std::list<NotifyArgs> KeyboardInputMapper::reconfigure(nsecs_t when,
 
     if (!changes.any() || changes.test(InputReaderConfiguration::Change::DISPLAY_INFO)) {
         mViewport = findViewport(config);
+        mVolumeKeysFlipped = isVolumeKeysFlippedViewport(mViewport);
     }
 
     if (!changes.any() ||
@@ -307,6 +354,9 @@ std::list<NotifyArgs> KeyboardInputMapper::processKey(nsecs_t when, nsecs_t read
         // Rotate key codes according to orientation if needed.
         if (mParameters.orientationAware) {
             keyCode = rotateKeyCode(keyCode, getOrientation(), mRotationMapOffset);
+            if (mVolumeKeysFlipped) {
+                keyCode = flipVolumeKeyCode(keyCode);
+            }
         }
 
         // Add key down.

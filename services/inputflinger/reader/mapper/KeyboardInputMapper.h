@@ -68,6 +68,7 @@ private:
     std::optional<KeyboardLayoutInfo> mKeyboardLayoutInfo;
 
     int32_t mRotationMapOffset; // determines if and how volume keys rotate
+    bool mVolumeKeysFlipped{}; // current display is mounted upside down relative to volume keys
 
     std::vector<KeyDown> mKeyDowns{}; // keys that are down
     int32_t mMetaState{};
