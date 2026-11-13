@@ -408,7 +408,14 @@ void DisplayModeController::setActiveModeLocked(PhysicalDisplayId displayId, Dis
     displayPtr->selectorPtr->setActiveMode(modeId, renderFps);
 
     if (mActiveModeListener) {
-        mActiveModeListener(displayId, vsyncRate, renderFps);
+        // For LTPO idle variants, show the rate the panel actually refreshes at.
+        if (const auto ltpoIdleFps =
+                    displayPtr->selectorPtr->getActiveMode().modePtr->getLtpoIdleFps();
+            ltpoIdleFps.isValid()) {
+            mActiveModeListener(displayId, ltpoIdleFps, ltpoIdleFps);
+        } else {
+            mActiveModeListener(displayId, vsyncRate, renderFps);
+        }
     }
 }
 

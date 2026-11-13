@@ -1267,6 +1267,9 @@ void SurfaceFlinger::getDynamicDisplayInfoInternal(ui::DynamicDisplayInfo*& info
     info->supportedDisplayModes.reserve(displayModes.size());
 
     for (const auto& [id, mode] : displayModes) {
+        // LTPO idle variants are internal to SurfaceFlinger.
+        if (mode->isLtpoIdleMode()) continue;
+
         ui::DisplayMode outMode;
         outMode.id = ftl::to_underlying(id);
 
@@ -1326,6 +1329,18 @@ void SurfaceFlinger::getDynamicDisplayInfoInternal(ui::DynamicDisplayInfo*& info
 
     const auto mode = display->refreshRateSelector().getActiveMode();
     info->activeDisplayModeId = ftl::to_underlying(mode.modePtr->getId());
+    if (mode.modePtr->isLtpoIdleMode()) {
+        // Report the regular mode the LTPO idle variant is based on.
+        for (const auto& [id, regularMode] : displayModes) {
+            if (!regularMode->isLtpoIdleMode() &&
+                regularMode->getResolution() == mode.modePtr->getResolution() &&
+                regularMode->getVsyncRate().getPeriodNsecs() ==
+                        mode.modePtr->getVsyncRate().getPeriodNsecs()) {
+                info->activeDisplayModeId = ftl::to_underlying(id);
+                break;
+            }
+        }
+    }
     info->renderFrameRate = mode.fps.getValue();
     info->hasArrSupport = mode.modePtr->getVrrConfig().has_value();
 
@@ -4193,9 +4208,28 @@ std::pair<DisplayModes, DisplayModePtr> SurfaceFlinger::loadDisplayModes(
                                                });
     ++nextModeId;
 
+    // Motorola panels encode refresh rate group flags in the HWC config group. They do not
+    // describe seamlessness, so normalize them, and turn the special idle modes (which report the
+    // regular vsync rate, but make the LTPO panel self-refresh at 1 Hz or 10 Hz) into LTPO idle
+    // variants that are only selected while the display is idle.
+    static const bool kMotoRefreshRateGroups =
+            base::GetBoolProperty("debug.sf.moto_refresh_rate_groups"s, false);
+    constexpr int32_t kMotoGroupSpecialIdle1Hz = 1 << 3;
+    constexpr int32_t kMotoGroupSpecialIdle10Hz = 1 << 4;
+
     DisplayModes newModes;
     for (const auto& hwcMode : hwcModes) {
         const auto id = nextModeId++;
+        int32_t group = hwcMode.configGroup;
+        Fps ltpoIdleFps;
+        if (kMotoRefreshRateGroups && !isExternalDisplay) {
+            if (group > 0 && (group & kMotoGroupSpecialIdle1Hz)) {
+                ltpoIdleFps = 1_Hz;
+            } else if (group > 0 && (group & kMotoGroupSpecialIdle10Hz)) {
+                ltpoIdleFps = 10_Hz;
+            }
+            group = 0;
+        }
         newModes.try_emplace(id,
                              DisplayMode::Builder(hwcMode.hwcId)
                                      .setId(id)
@@ -4205,8 +4239,9 @@ std::pair<DisplayModes, DisplayModePtr> SurfaceFlinger::loadDisplayModes(
                                      .setVrrConfig(hwcMode.vrrConfig)
                                      .setDpiX(hwcMode.dpiX)
                                      .setDpiY(hwcMode.dpiY)
-                                     .setGroup(hwcMode.configGroup)
+                                     .setGroup(group)
                                      .setHdrOutputType(hwcMode.hdrOutputType)
+                                     .setLtpoIdleFps(ltpoIdleFps)
                                      .build());
     }
 

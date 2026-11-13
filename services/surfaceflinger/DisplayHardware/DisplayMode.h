@@ -119,6 +119,13 @@ public:
             return *this;
         }
 
+        // Marks this mode as an LTPO idle variant: it has the same vsync rate as a regular mode,
+        // but the panel self-refreshes at the given (lower) rate while no new frames are pushed.
+        Builder& setLtpoIdleFps(Fps ltpoIdleFps) {
+            mDisplayMode->mLtpoIdleFps = ltpoIdleFps;
+            return *this;
+        }
+
     private:
         float getDefaultDensity() {
             // Default density is based on TVs: 1080p displays get XHIGH density, lower-
@@ -171,6 +178,11 @@ public:
 
     hal::OutputType getHdrOutputType() const { return mHdrOutputType; }
 
+    // LTPO idle variants are never selected for content. They are only used while the display is
+    // idle, and are hidden from DisplayManager.
+    Fps getLtpoIdleFps() const { return mLtpoIdleFps; }
+    bool isLtpoIdleMode() const { return mLtpoIdleFps.isValid(); }
+
 private:
     explicit DisplayMode(hal::HWConfigId id) : mHwcId(id) {}
 
@@ -185,6 +197,7 @@ private:
     int32_t mGroup = -1;
     std::optional<hal::VrrConfig> mVrrConfig;
     hal::OutputType mHdrOutputType;
+    Fps mLtpoIdleFps;
 };
 
 inline bool equalsExceptDisplayModeId(const DisplayMode& lhs, const DisplayMode& rhs) {
@@ -192,17 +205,23 @@ inline bool equalsExceptDisplayModeId(const DisplayMode& lhs, const DisplayMode&
             lhs.getVsyncRate().getPeriodNsecs() == rhs.getVsyncRate().getPeriodNsecs() &&
             lhs.getDpi() == rhs.getDpi() && lhs.getGroup() == rhs.getGroup() &&
             lhs.getVrrConfig() == rhs.getVrrConfig() &&
-            lhs.getHdrOutputType() == rhs.getHdrOutputType();
+            lhs.getHdrOutputType() == rhs.getHdrOutputType() &&
+            lhs.getLtpoIdleFps().getPeriodNsecs() == rhs.getLtpoIdleFps().getPeriodNsecs();
 }
 
 inline std::string to_string(const DisplayMode& mode) {
-    return base::StringPrintf("{id=%d, hwcId=%d, resolution=%dx%d, vsyncRate=%s, "
-                              "dpi=%.2fx%.2f, group=%d, vrrConfig=%s, hdrOutputType=%s}",
-                              ftl::to_underlying(mode.getId()), mode.getHwcId(), mode.getWidth(),
-                              mode.getHeight(), to_string(mode.getVsyncRate()).c_str(),
-                              mode.getDpi().x, mode.getDpi().y, mode.getGroup(),
-                              to_string(mode.getVrrConfig()).c_str(),
-                              toString(mode.getHdrOutputType()).c_str());
+    std::string str =
+            base::StringPrintf("{id=%d, hwcId=%d, resolution=%dx%d, vsyncRate=%s, "
+                               "dpi=%.2fx%.2f, group=%d, vrrConfig=%s, hdrOutputType=%s}",
+                               ftl::to_underlying(mode.getId()), mode.getHwcId(), mode.getWidth(),
+                               mode.getHeight(), to_string(mode.getVsyncRate()).c_str(),
+                               mode.getDpi().x, mode.getDpi().y, mode.getGroup(),
+                               to_string(mode.getVrrConfig()).c_str(),
+                               toString(mode.getHdrOutputType()).c_str());
+    if (mode.isLtpoIdleMode()) {
+        str.insert(str.size() - 1, ", ltpoIdleFps=" + to_string(mode.getLtpoIdleFps()));
+    }
+    return str;
 }
 
 template <typename... DisplayModePtrs>

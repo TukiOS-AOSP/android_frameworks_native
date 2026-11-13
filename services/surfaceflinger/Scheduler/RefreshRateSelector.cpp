@@ -86,6 +86,7 @@ std::vector<DisplayModeIterator> sortByRefreshRate(const DisplayModes& modes) {
     std::vector<DisplayModeIterator> sortedModes;
     sortedModes.reserve(modes.size());
     for (auto it = modes.begin(); it != modes.end(); ++it) {
+        if (it->second->isLtpoIdleMode()) continue;
         sortedModes.push_back(it);
     }
 
@@ -636,7 +637,9 @@ auto RefreshRateSelector::getRankedFrameRatesLocked(const std::vector<LayerRequi
     const LayerRequirementPtrs layers = filterLayersForOutput(allLayers, mLayerFilter);
     ALOGV("%s: %zu allLayers, %zu layers", __func__, allLayers.size(), layers.size());
 
-    const auto& activeMode = *getActiveModeLocked().modePtr;
+    // While an LTPO idle variant is active, rank as if its regular counterpart was active.
+    const FrameRateMode activeFrameRateMode = getActiveRegularModeLocked();
+    const auto& activeMode = *activeFrameRateMode.modePtr;
 
     if (pacesetterFps.isValid() &&
         !FlagManager::getInstance().follower_arbitrary_refresh_rate_selection_combined()) {
@@ -794,7 +797,15 @@ auto RefreshRateSelector::getRankedFrameRatesLocked(const std::vector<LayerRequi
     if (!signals.touch && signals.idle &&
         !(policy->primaryRangeIsSingleRate() && hasExplicitVoteLayers)) {
         ALOGV("Idle");
-        const auto ranking = rankFrameRates(activeMode.getGroup(), RefreshRateOrder::Ascending);
+        auto ranking = rankFrameRates(activeMode.getGroup(), RefreshRateOrder::Ascending);
+        if (const auto ltpoIdleModeOpt = getLtpoIdleModeLocked(/*deepest*/ true)) {
+            constexpr float kScore = std::numeric_limits<float>::max();
+            ranking.insert(ranking.begin(), ScoredFrameRate{*ltpoIdleModeOpt, kScore});
+            SFTRACE_FORMAT_INSTANT("%s (Idle, LTPO %s)",
+                                   to_string(ltpoIdleModeOpt->fps).c_str(),
+                                   to_string(ltpoIdleModeOpt->modePtr->getLtpoIdleFps()).c_str());
+            return {ranking, GlobalSignals{.idle = true}};
+        }
         SFTRACE_FORMAT_INSTANT("%s (Idle)", to_string(ranking.front().frameRateMode.fps).c_str());
         return {ranking, GlobalSignals{.idle = true}};
     }
@@ -812,7 +823,7 @@ auto RefreshRateSelector::getRankedFrameRatesLocked(const std::vector<LayerRequi
         ALOGV("All layers NoPreference");
         constexpr float kScore = std::numeric_limits<float>::max();
         FrameRateRanking currentMode;
-        currentMode.emplace_back(ScoredFrameRate{getActiveModeLocked(), kScore});
+        currentMode.emplace_back(ScoredFrameRate{activeFrameRateMode, kScore});
         SFTRACE_FORMAT_INSTANT("%s (All layers NoPreference)",
                               to_string(currentMode.front().frameRateMode.fps).c_str());
         return {currentMode, kNoSignals};
@@ -824,11 +835,17 @@ auto RefreshRateSelector::getRankedFrameRatesLocked(const std::vector<LayerRequi
     // Only if all layers want Min we should return Min
     if (noVoteLayers + minVoteLayers == layers.size()) {
         ALOGV("All layers Min");
-        const auto ranking = rankFrameRates(activeMode.getGroup(), RefreshRateOrder::Ascending,
-                                            std::nullopt, [&](FrameRateMode mode) {
-                                                return !smoothSwitchOnly ||
-                                                        mode.modePtr->getId() == activeModeId;
-                                            });
+        auto ranking = rankFrameRates(activeMode.getGroup(), RefreshRateOrder::Ascending,
+                                      std::nullopt, [&](FrameRateMode mode) {
+                                          return !smoothSwitchOnly ||
+                                                  mode.modePtr->getId() == activeModeId;
+                                      });
+        if (!smoothSwitchOnly) {
+            if (const auto ltpoIdleModeOpt = getLtpoIdleModeLocked(/*deepest*/ false)) {
+                constexpr float kScore = std::numeric_limits<float>::max();
+                ranking.insert(ranking.begin(), ScoredFrameRate{*ltpoIdleModeOpt, kScore});
+            }
+        }
         SFTRACE_FORMAT_INSTANT("%s (All layers Min)",
                                to_string(ranking.front().frameRateMode.fps).c_str());
         return {ranking, kNoSignals};
@@ -1262,7 +1279,8 @@ ftl::Optional<FrameRateMode> RefreshRateSelector::onKernelTimerChanged(
 }
 
 const DisplayModePtr& RefreshRateSelector::getMinRefreshRateByPolicyLocked() const {
-    const auto& activeMode = *getActiveModeLocked().modePtr;
+    const auto activeFrameRateMode = getActiveRegularModeLocked();
+    const auto& activeMode = *activeFrameRateMode.modePtr;
 
     for (const FrameRateMode& mode : mPrimaryFrameRates) {
         if (activeMode.getGroup() == mode.modePtr->getGroup()) {
@@ -1599,8 +1617,64 @@ auto RefreshRateSelector::getDisplayManagerPolicy() const -> Policy {
 
 bool RefreshRateSelector::isModeAllowed(const FrameRateMode& mode) const {
     std::lock_guard lock(mLock);
+    if (mode.modePtr->isLtpoIdleMode()) {
+        return isLtpoIdleModeAllowedLocked(*mode.modePtr) &&
+                isApproxEqual(mode.fps, mode.modePtr->getVsyncRate());
+    }
     return std::find(mAppRequestFrameRates.begin(), mAppRequestFrameRates.end(), mode) !=
             mAppRequestFrameRates.end();
+}
+
+bool RefreshRateSelector::isLtpoIdleModeAllowedLocked(const DisplayMode& mode) const {
+    using namespace fps_approx_ops;
+
+    if (!mode.isLtpoIdleMode()) return false;
+
+    const Policy* policy = getCurrentPolicyLocked();
+    const auto defaultModeOpt = mDisplayModes.get(policy->defaultMode);
+    if (!defaultModeOpt) return false;
+    const auto& defaultMode = defaultModeOpt->get();
+
+    // Only use variants of the current resolution, and respect the minimum refresh rate
+    // requested by DisplayManager (e.g. the user's minimum refresh rate setting).
+    const Fps idleFps = mode.getLtpoIdleFps();
+    return mode.getResolution() == defaultMode->getResolution() &&
+            mode.getDpi() == defaultMode->getDpi() &&
+            idleFps >= policy->primaryRanges.physical.min &&
+            idleFps >= policy->primaryRanges.render.min;
+}
+
+std::optional<FrameRateMode> RefreshRateSelector::getLtpoIdleModeLocked(bool deepest) const {
+    std::optional<FrameRateMode> ltpoIdleModeOpt;
+    for (const auto& [id, mode] : mDisplayModes) {
+        if (!isLtpoIdleModeAllowedLocked(*mode)) continue;
+
+        const Fps idleFps = mode->getLtpoIdleFps();
+        if (ltpoIdleModeOpt) {
+            const Fps bestIdleFps = ltpoIdleModeOpt->modePtr->getLtpoIdleFps();
+            if (deepest ? !isStrictlyLess(idleFps, bestIdleFps)
+                        : !isStrictlyLess(bestIdleFps, idleFps)) {
+                continue;
+            }
+        }
+        ltpoIdleModeOpt = FrameRateMode{mode->getVsyncRate(), ftl::as_non_null(mode)};
+    }
+    return ltpoIdleModeOpt;
+}
+
+FrameRateMode RefreshRateSelector::getActiveRegularModeLocked() const {
+    const FrameRateMode& activeMode = getActiveModeLocked();
+    if (!activeMode.modePtr->isLtpoIdleMode()) return activeMode;
+
+    for (const auto& [id, mode] : mDisplayModes) {
+        if (!mode->isLtpoIdleMode() &&
+            mode->getResolution() == activeMode.modePtr->getResolution() &&
+            mode->getVsyncRate().getPeriodNsecs() ==
+                    activeMode.modePtr->getVsyncRate().getPeriodNsecs()) {
+            return FrameRateMode{mode->getVsyncRate(), ftl::as_non_null(mode)};
+        }
+    }
+    return activeMode;
 }
 
 void RefreshRateSelector::constructAvailableRefreshRates() {
@@ -1627,7 +1701,8 @@ void RefreshRateSelector::constructAvailableRefreshRates() {
             bool hdrOutputTypeMatches = FlagManager::getInstance().enable_user_preferred_hdr_mode()
                     ? mode.getHdrOutputType() == defaultMode->getHdrOutputType()
                     : true;
-            return mode.getResolution() == defaultMode->getResolution() &&
+            return !mode.isLtpoIdleMode() &&
+                    mode.getResolution() == defaultMode->getResolution() &&
                     mode.getDpi() == defaultMode->getDpi() &&
                     (allowAllGroups || policy->allowGroupSwitching ||
                      mode.getGroup() == defaultMode->getGroup()) &&

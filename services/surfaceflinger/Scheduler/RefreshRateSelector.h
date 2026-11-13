@@ -456,6 +456,14 @@ private:
     // uses the primary range, not the app request range.
     const DisplayModePtr& getMinRefreshRateByPolicyLocked() const REQUIRES(mLock);
 
+    // LTPO idle variants: regular vsync rate, but the panel self-refreshes at a lower rate while
+    // no new frames are pushed. Only used for the idle and "all layers Min" decisions.
+    bool isLtpoIdleModeAllowedLocked(const DisplayMode&) const REQUIRES(mLock);
+    // Returns the allowed LTPO idle variant with the lowest (deepest) or highest idle rate.
+    std::optional<FrameRateMode> getLtpoIdleModeLocked(bool deepest) const REQUIRES(mLock);
+    // Returns the active mode, or its regular counterpart if an LTPO idle variant is active.
+    FrameRateMode getActiveRegularModeLocked() const REQUIRES(mLock);
+
     // Returns the highest refresh rate according to the current policy. May change at runtime. Only
     // uses the primary range, not the app request range.
     const DisplayModePtr& getMaxRefreshRateByPolicyLocked(int anchorGroup) const REQUIRES(mLock);

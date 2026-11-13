@@ -651,6 +651,10 @@ void Scheduler::onFrameRateOverridesChanged() {
     }();
     auto [pacesetterMode, overrides] = getFrameRateOverrides();
 
+    // LTPO idle variants are hidden from DisplayManager. The overrides are sent along with the
+    // next regular mode change.
+    if (pacesetterMode.modePtr->isLtpoIdleMode()) return;
+
     const auto vsyncConfigSet = getVsyncConfigsForRefreshRate(pacesetterMode.fps);
     mEventThread
             ->onModeAndFrameRateOverridesChanged(pacesetterId, pacesetterMode, std::move(overrides),
@@ -699,7 +703,8 @@ bool Scheduler::onDisplayModeAndFrameRateOverridesChanged(PhysicalDisplayId disp
                                                           bool clearContentRequirements) {
     const bool isPacesetter =
             updatePolicyContentRequirements(displayId, mode, clearContentRequirements);
-    if (hasEventThreads()) {
+    // LTPO idle variants are hidden from DisplayManager, which keeps the last regular mode.
+    if (hasEventThreads() && !mode.modePtr->isLtpoIdleMode()) {
         const PhysicalDisplayId pacesetterId = [this] {
             std::scoped_lock lock(mDisplayLock);
             return FTL_FAKE_GUARD(kMainThreadContext, *mPacesetterDisplayId);
@@ -729,6 +734,11 @@ void Scheduler::emitPacesetterModeChangeIfNeeded() {
     }
 
     const auto& mode = *mPolicy.modeOpt[pacesetterId];
+
+    if (mode.modePtr->isLtpoIdleMode()) {
+        // LTPO idle variants are hidden from DisplayManager.
+        return;
+    }
 
     if (mode != pacesetterSelectorPtr()->getActiveMode()) {
         // A mode change is pending. The event will be emitted when the mode becomes active.
